@@ -11,16 +11,17 @@ import logging
 from ultralytics import YOLO
 from queue import Queue
 import threading
+import json
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})  # CORS explicite
 
 # Configurer le logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # File d'attente pour limiter les requêtes simultanées
-request_queue = Queue(maxsize=1)
+request_queue = Queue(maxsize=5)  # Augmenté à 5
 queue_lock = threading.Lock()
 
 # Charger le modèle MiDaS via torch.hub
@@ -134,6 +135,7 @@ def upload_ply():
         if not file.filename.endswith(".ply"):
             return jsonify({"error": "Le fichier doit être au format .ply"}), 400
 
+        logger.debug(f"Requête /upload reçue pour le fichier : {file.filename}")
         mesh = trimesh.load(file, file_type="ply")
         if not isinstance(mesh, trimesh.PointCloud):
             return jsonify({"error": "Le fichier n'est pas un nuage de points valide"}), 400
@@ -157,6 +159,7 @@ def upload_ply():
             colors = colors.tolist()
 
         ply_file, filename = create_ply_file(positions, colors)
+        logger.debug("Fichier PLY généré pour /upload")
         return send_file(
             ply_file,
             mimetype="text/plain",
@@ -177,11 +180,12 @@ def upload_image():
         request_queue.put_nowait(True)
 
     try:
+        logger.debug("Requête /upload_image reçue")
         file = request.files["file"]
         image = Image.open(file).convert("RGB")
         logger.debug("Image reçue et ouverte")
         
-        image = image.resize((256, 192), Image.LANCZOS)
+        image = image.resize((160, 120), Image.LANCZOS)  # Réduit à 160x120
         image_np = np.array(image)
 
         # Prétraitement pour MiDaS
@@ -193,7 +197,7 @@ def upload_image():
             prediction = midas(input_batch)
             prediction = torch.nn.functional.interpolate(
                 prediction.unsqueeze(1),
-                size=(192, 256),
+                size=(120, 160),
                 mode="bicubic",
                 align_corners=False,
             ).squeeze().cpu().numpy()
@@ -213,9 +217,9 @@ def upload_image():
                 if label in ["person", "car", "truck", "animal", "bed", "tv"]:
                     x_center = (x1 + x2) // 2
                     y_center = (y1 + y2) // 2
-                    z = depth[y_center, x_center] / np.max(depth)
-                    x_norm = (x_center - 256 / 2) / max(256, 192)
-                    y_norm = (y_center - 192 / 2) / max(256, 192)
+                    z = float(depth[y_center, x_center] / np.max(depth))
+                    x_norm = float((x_center - 160 / 2) / max(160, 120))
+                    y_norm = float((y_center - 120 / 2) / max(160, 120))
                     latest_annotations.append({
                         "type": "sphere",
                         "position": [x_norm, -y_norm, z],
@@ -232,9 +236,9 @@ def upload_image():
         for y in range(0, h, 2):
             for x in range(0, w, 2):
                 z = depth[y, x]
-                x_norm = (x - w / 2) / max(w, h)
-                y_norm = (y - h / 2) / max(w, h)
-                z_norm = z / np.max(depth)
+                x_norm = float((x - w / 2) / max(w, h))
+                y_norm = float((y - h / 2) / max(w, h))
+                z_norm = float(z / np.max(depth))
                 positions.append([x_norm, -y_norm, z_norm])
                 colors.append(image_np[y, x] / 255.0)
 
@@ -270,7 +274,14 @@ def upload_image():
 def get_annotations():
     try:
         global latest_annotations
-        return jsonify({"annotations": latest_annotations})
+        serializable_annotations = []
+        for anno in latest_annotations:
+            serializable_anno = anno.copy()
+            serializable_anno["position"] = [float(x) for x in anno["position"]]
+            serializable_anno["radius"] = float(anno["radius"])
+            serializable_annotations.append(serializable_anno)
+        logger.debug(f"Envoi de {len(serializable_annotations)} annotations")
+        return jsonify({"annotations": serializable_annotations})
     except Exception as e:
         logger.error(f"Erreur dans /get_annotations : {str(e)}")
         return jsonify({"error": str(e)}), 500
@@ -278,6 +289,7 @@ def get_annotations():
 @app.route("/run_script", methods=["POST"])
 def run_script():
     try:
+        logger.debug("Requête /run_script reçue")
         data = request.get_json()
         commands = data.get("commands", [])
         positions = np.array(data.get("positions", []), dtype=np.float32)
@@ -304,8 +316,8 @@ def run_script():
             elif cmd["type"] == "highlight":
                 annotations.append({
                     "type": "sphere",
-                    "position": cmd.get("position", [0, 0, 0]),
-                    "radius": cmd.get("radius", 0.015),
+                    "position": [float(x) for x in cmd.get("position", [0, 0, 0])],
+                    "radius": float(cmd.get("radius", 0.015)),
                     "color": cmd.get("color", "#00ff00"),
                 })
 
@@ -326,26 +338,26 @@ def run_script():
                     if distance > threshold:
                         annotations.append({
                             "type": "sphere",
-                            "position": point.tolist(),
+                            "position": [float(x) for x in point.tolist()],
                             "radius": 0.015,
                             "color": cmd.get("color", "#ff00ff"),
                         })
                     else:
-                        valid_points.append(point.tolist())
+                        valid_points.append([float(x) for x in point.tolist()])
 
             elif cmd["type"] == "draw_lines" and len(valid_points) > 1:
                 annotations.append({
                     "type": "line",
                     "points": valid_points,
                     "color": cmd.get("color", "#00ff00"),
-                    "thickness": cmd.get("thickness", 0.01),
+                    "thickness": float(cmd.get("thickness", 0.01)),
                 })
 
             elif cmd["type"] == "topography":
                 topo_data = compute_topography(polydata)
                 annotations.append({
                     "type": "sphere",
-                    "position": [0, 0, topo_data["max_height"]],
+                    "position": [0, 0, float(topo_data["max_height"])],
                     "radius": 0.03,
                     "color": cmd.get("color", "#ffff00"),
                     "label": f"Max Height: {topo_data['max_height']:.2f}",
@@ -360,6 +372,7 @@ def run_script():
 @app.route("/run_inference", methods=["POST"])
 def run_inference():
     try:
+        logger.debug("Requête /run_inference reçue")
         data = request.get_json()
         script = data.get("script", {})
         positions = np.array(data.get("positions", []), dtype=np.float32)
@@ -377,7 +390,7 @@ def run_inference():
         z_min, z_max = np.min(z_values), np.max(z_values)
         
         for z in z_values:
-            t = (z - z_min) / (z_max - z_min + 1e-6)
+            t = float((z - z_min) / (z_max - z_min + 1e-6))
             r = int(255 * t)
             g = 0
             b = int(255 * (1 - t))
@@ -389,7 +402,7 @@ def run_inference():
         topo_data = compute_topography(polydata)
         annotations.append({
             "type": "sphere",
-            "position": [0, 0, topo_data["max_height"]],
+            "position": [0, 0, float(topo_data["max_height"])],
             "radius": 0.03,
             "color": script.get("actions", [{}])[0].get("color", "#ffff00"),
             "label": f"Max Height: {topo_data['max_height']:.2f}",
