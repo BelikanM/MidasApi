@@ -12,19 +12,21 @@ from ultralytics import YOLO
 from queue import Queue
 import threading
 import json
+import uuid
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})  # CORS explicite
+app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # Limite à 10 Mo
+CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
 
 # Configurer le logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # File d'attente pour limiter les requêtes simultanées
-request_queue = Queue(maxsize=5)  # Augmenté à 5
+request_queue = Queue(maxsize=5)
 queue_lock = threading.Lock()
 
-# Charger le modèle MiDaS via torch.hub
+# Charger le modèle MiDaS
 try:
     model_type = "MiDaS_small"
     midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
@@ -130,19 +132,45 @@ def compute_topography(polydata):
 
 @app.route("/upload", methods=["POST"])
 def upload_ply():
+    with queue_lock:
+        if request_queue.full():
+            logger.warning("File d'attente pleine, requête ignorée")
+            return jsonify({"error": "Serveur occupé, réessayez plus tard"}), 429
+        request_queue.put_nowait(True)
+    
     try:
+        logger.debug("Requête /upload reçue")
+        if "file" not in request.files:
+            logger.error("Aucun fichier envoyé")
+            request_queue.get_nowait()
+            return jsonify({"error": "Aucun fichier envoyé"}), 400
+
         file = request.files["file"]
         if not file.filename.endswith(".ply"):
+            logger.error(f"Fichier non PLY : {file.filename}")
+            request_queue.get_nowait()
             return jsonify({"error": "Le fichier doit être au format .ply"}), 400
 
-        logger.debug(f"Requête /upload reçue pour le fichier : {file.filename}")
-        mesh = trimesh.load(file, file_type="ply")
+        cloud_id = str(uuid.uuid4())  # Générer un ID unique
+        logger.debug(f"Traitement du fichier PLY : {file.filename}, cloud_id: {cloud_id}")
+        file_content = file.read()
+        try:
+            mesh = trimesh.load(file_obj=io.BytesIO(file_content), file_type="ply")
+        except Exception as e:
+            logger.error(f"Erreur lors du chargement du PLY : {str(e)}")
+            request_queue.get_nowait()
+            return jsonify({"error": f"Erreur lors du chargement du PLY : {str(e)}"}), 400
+
         if not isinstance(mesh, trimesh.PointCloud):
+            logger.error("Le fichier n'est pas un nuage de points valide")
+            request_queue.get_nowait()
             return jsonify({"error": "Le fichier n'est pas un nuage de points valide"}), 400
 
         positions = mesh.vertices.astype(np.float32)
-        
+        logger.debug(f"Positions extraites : {len(positions)} points")
+
         if len(positions) > 50000:
+            logger.debug("Décimation du nuage de points")
             polydata = create_vtk_point_cloud(positions)
             decimate = vtk.vtkDecimatePro()
             decimate.SetInputData(polydata)
@@ -157,17 +185,20 @@ def upload_ply():
         if hasattr(mesh, "colors") and mesh.colors is not None:
             colors = mesh.colors[:, :3].astype(float) / 255.0
             colors = colors.tolist()
+            logger.debug(f"Couleurs extraites : {len(colors)}")
 
         ply_file, filename = create_ply_file(positions, colors)
         logger.debug("Fichier PLY généré pour /upload")
+        request_queue.get_nowait()
         return send_file(
             ply_file,
             mimetype="text/plain",
             as_attachment=True,
             download_name=filename
-        )
+        ), 200, {"X-Cloud-ID": cloud_id}
     except Exception as e:
         logger.error(f"Erreur dans /upload : {str(e)}")
+        request_queue.get_nowait()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/upload_image", methods=["POST"])
@@ -176,19 +207,18 @@ def upload_image():
         if request_queue.full():
             logger.warning("File d'attente pleine, requête ignorée")
             return jsonify({"error": "Serveur occupé, réessayez plus tard"}), 429
-
         request_queue.put_nowait(True)
 
     try:
-        logger.debug("Requête /upload_image reçue")
+        cloud_id = str(uuid.uuid4())  # Générer un ID unique
+        logger.debug(f"Requête /upload_image reçue, cloud_id: {cloud_id}")
         file = request.files["file"]
         image = Image.open(file).convert("RGB")
         logger.debug("Image reçue et ouverte")
         
-        image = image.resize((160, 120), Image.LANCZOS)  # Réduit à 160x120
+        image = image.resize((160, 120), Image.LANCZOS)
         image_np = np.array(image)
 
-        # Prétraitement pour MiDaS
         img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         input_batch = transform(img).to(device)
         logger.debug("Image prétraitée pour MiDaS")
@@ -205,7 +235,6 @@ def upload_image():
 
         depth = prediction
 
-        # Détection d'objets avec YOLOv8
         results = yolo(image_np, conf=0.5)
         global latest_annotations
         latest_annotations = []
@@ -229,7 +258,6 @@ def upload_image():
                     })
         logger.debug(f"{len(latest_annotations)} anomalies détectées par YOLOv8")
 
-        # Créer le nuage de points
         positions = []
         colors = []
         h, w = depth.shape
@@ -254,20 +282,35 @@ def upload_image():
             colors = colors[:len(positions)] if colors else None
         logger.debug(f"Nuage de points créé : {len(positions)} points")
 
-        # Générer le fichier PLY
         ply_file, filename = create_ply_file(positions, colors)
         logger.debug("Fichier PLY généré")
-
         request_queue.get_nowait()
         return send_file(
             ply_file,
             mimetype="text/plain",
             as_attachment=True,
             download_name=filename
-        )
+        ), 200, {"X-Cloud-ID": cloud_id}
     except Exception as e:
         logger.error(f"Erreur dans /upload_image : {str(e)}")
         request_queue.get_nowait()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/store_image", methods=["POST"])
+def store_image():
+    try:
+        logger.debug("Requête /store_image reçue")
+        if "file" not in request.files:
+            logger.error("Aucun fichier envoyé")
+            return jsonify({"error": "Aucun fichier envoyé"}), 400
+
+        file = request.files["file"]
+        image_id = str(uuid.uuid4())
+        file.save(f"images/{image_id}.jpg")
+        logger.debug(f"Image sauvegardée : {image_id}.jpg")
+        return jsonify({"image_id": image_id}), 200
+    except Exception as e:
+        logger.error(f"Erreur dans /store_image : {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/get_annotations", methods=["POST"])
