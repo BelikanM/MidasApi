@@ -1,0 +1,10 @@
+vtk
+trimesh
+numpy
+flask
+flask-cors
+torch
+torchvision
+Pillow
+opencv-python
+ultralytics
