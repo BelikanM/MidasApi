@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import trimesh
 import vtk
@@ -7,20 +7,48 @@ import torch
 import cv2
 from PIL import Image
 import io
+import logging
+from ultralytics import YOLO
+from queue import Queue
+import threading
 
 app = Flask(__name__)
 CORS(app)
 
-# Charger le modèle MiDaS via torch.hub
-model_type = "MiDaS_small"  # Plus léger pour le temps réel
-midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
-midas.eval()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-midas.to(device)
+# Configurer le logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-# Transformations pour MiDaS
+# File d'attente pour limiter les requêtes simultanées
+request_queue = Queue(maxsize=1)
+queue_lock = threading.Lock()
+
+# Charger le modèle MiDaS via torch.hub
+try:
+    model_type = "MiDaS_small"
+    midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
+    midas.eval()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    midas.to(device)
+    logger.info("Modèle MiDaS chargé avec succès")
+except Exception as e:
+    logger.error(f"Erreur lors du chargement de MiDaS : {str(e)}")
+    raise e
+
 midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
 transform = midas_transforms.small_transform
+
+# Charger le modèle YOLOv8
+try:
+    yolo = YOLO("yolov8n.pt")
+    yolo.to(device)
+    logger.info("Modèle YOLOv8 chargé avec succès")
+except Exception as e:
+    logger.error(f"Erreur lors du chargement de YOLOv8 : {str(e)}")
+    raise e
+
+# Stockage temporaire des annotations
+latest_annotations = []
 
 def create_vtk_point_cloud(positions, colors=None):
     points = vtk.vtkPoints()
@@ -47,6 +75,57 @@ def create_vtk_point_cloud(positions, colors=None):
         polydata.GetPointData().SetScalars(color_array)
     
     return polydata
+
+def create_ply_file(positions, colors=None):
+    vertex_count = len(positions)
+    header = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {vertex_count}",
+        "property float x",
+        "property float y",
+        "property float z",
+    ]
+    if colors is not None:
+        header.extend([
+            "property uchar red",
+            "property uchar green",
+            "property uchar blue",
+        ])
+    header.append("end_header")
+
+    lines = header[:]
+    for i in range(vertex_count):
+        pos = positions[i]
+        if colors is not None:
+            col = colors[i]
+            line = f"{pos[0]} {pos[1]} {pos[2]} {int(col[0] * 255)} {int(col[1] * 255)} {int(col[2] * 255)}"
+        else:
+            line = f"{pos[0]} {pos[1]} {pos[2]}"
+        lines.append(line)
+    
+    ply_content = "\n".join(lines)
+    return io.BytesIO(ply_content.encode("ascii")), "point_cloud.ply"
+
+def compute_topography(polydata):
+    points = np.array(polydata.GetPoints().GetData())
+    z_values = points[:, 2]
+    z_min, z_max = np.min(z_values), np.max(z_values)
+    
+    slopes = []
+    for i in range(len(points) - 1):
+        p1, p2 = points[i], points[i + 1]
+        dx = p2[0] - p1[0]
+        dz = p2[2] - p1[2]
+        slope = abs(dz / (dx + 1e-6))
+        slopes.append(slope)
+    
+    avg_slope = np.mean(slopes) if slopes else 0
+    return {
+        "min_height": float(z_min),
+        "max_height": float(z_max),
+        "avg_slope": float(avg_slope),
+    }
 
 @app.route("/upload", methods=["POST"])
 def upload_ply():
@@ -77,34 +156,76 @@ def upload_ply():
             colors = mesh.colors[:, :3].astype(float) / 255.0
             colors = colors.tolist()
 
-        return jsonify({"positions": positions, "colors": colors})
+        ply_file, filename = create_ply_file(positions, colors)
+        return send_file(
+            ply_file,
+            mimetype="text/plain",
+            as_attachment=True,
+            download_name=filename
+        )
     except Exception as e:
+        logger.error(f"Erreur dans /upload : {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/upload_image", methods=["POST"])
 def upload_image():
+    with queue_lock:
+        if request_queue.full():
+            logger.warning("File d'attente pleine, requête ignorée")
+            return jsonify({"error": "Serveur occupé, réessayez plus tard"}), 429
+
+        request_queue.put_nowait(True)
+
     try:
         file = request.files["file"]
         image = Image.open(file).convert("RGB")
+        logger.debug("Image reçue et ouverte")
         
-        # Réduire la résolution pour le temps réel
-        image = image.resize((320, 240), Image.LANCZOS)
+        image = image.resize((256, 192), Image.LANCZOS)
         image_np = np.array(image)
 
         # Prétraitement pour MiDaS
         img = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
         input_batch = transform(img).to(device)
+        logger.debug("Image prétraitée pour MiDaS")
 
         with torch.no_grad():
             prediction = midas(input_batch)
             prediction = torch.nn.functional.interpolate(
                 prediction.unsqueeze(1),
-                size=(240, 320),
+                size=(192, 256),
                 mode="bicubic",
                 align_corners=False,
             ).squeeze().cpu().numpy()
+        logger.debug("Prédiction de profondeur terminée")
 
         depth = prediction
+
+        # Détection d'objets avec YOLOv8
+        results = yolo(image_np, conf=0.5)
+        global latest_annotations
+        latest_annotations = []
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls = int(box.cls[0])
+                label = yolo.names[cls]
+                if label in ["person", "car", "truck", "animal", "bed", "tv"]:
+                    x_center = (x1 + x2) // 2
+                    y_center = (y1 + y2) // 2
+                    z = depth[y_center, x_center] / np.max(depth)
+                    x_norm = (x_center - 256 / 2) / max(256, 192)
+                    y_norm = (y_center - 192 / 2) / max(256, 192)
+                    latest_annotations.append({
+                        "type": "sphere",
+                        "position": [x_norm, -y_norm, z],
+                        "radius": 0.02,
+                        "color": "#ff0000",
+                        "label": label,
+                    })
+        logger.debug(f"{len(latest_annotations)} anomalies détectées par YOLOv8")
+
+        # Créer le nuage de points
         positions = []
         colors = []
         h, w = depth.shape
@@ -127,9 +248,31 @@ def upload_image():
             reduced_polydata = decimate.GetOutput()
             positions = np.array(reduced_polydata.GetPoints().GetData())
             colors = colors[:len(positions)] if colors else None
+        logger.debug(f"Nuage de points créé : {len(positions)} points")
 
-        return jsonify({"positions": positions.tolist(), "colors": colors if colors else None})
+        # Générer le fichier PLY
+        ply_file, filename = create_ply_file(positions, colors)
+        logger.debug("Fichier PLY généré")
+
+        request_queue.get_nowait()
+        return send_file(
+            ply_file,
+            mimetype="text/plain",
+            as_attachment=True,
+            download_name=filename
+        )
     except Exception as e:
+        logger.error(f"Erreur dans /upload_image : {str(e)}")
+        request_queue.get_nowait()
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/get_annotations", methods=["POST"])
+def get_annotations():
+    try:
+        global latest_annotations
+        return jsonify({"annotations": latest_annotations})
+    except Exception as e:
+        logger.error(f"Erreur dans /get_annotations : {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/run_script", methods=["POST"])
@@ -198,8 +341,20 @@ def run_script():
                     "thickness": cmd.get("thickness", 0.01),
                 })
 
+            elif cmd["type"] == "topography":
+                topo_data = compute_topography(polydata)
+                annotations.append({
+                    "type": "sphere",
+                    "position": [0, 0, topo_data["max_height"]],
+                    "radius": 0.03,
+                    "color": cmd.get("color", "#ffff00"),
+                    "label": f"Max Height: {topo_data['max_height']:.2f}",
+                })
+                return jsonify({"measurements": topo_data, "annotations": annotations})
+
         return jsonify({"annotations": annotations})
     except Exception as e:
+        logger.error(f"Erreur dans /run_script : {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/run_inference", methods=["POST"])
@@ -231,18 +386,18 @@ def run_inference():
         polydata.GetPointData().SetScalars(color_array)
         
         annotations = []
-        for i in range(polydata.GetNumberOfPoints()):
-            if np.random.random() > 0.5:
-                point = polydata.GetPoint(i)
-                annotations.append({
-                    "type": "sphere",
-                    "position": list(point),
-                    "radius": 0.015,
-                    "color": script.get("actions", [{}])[0].get("color", "#ff00ff"),
-                })
+        topo_data = compute_topography(polydata)
+        annotations.append({
+            "type": "sphere",
+            "position": [0, 0, topo_data["max_height"]],
+            "radius": 0.03,
+            "color": script.get("actions", [{}])[0].get("color", "#ffff00"),
+            "label": f"Max Height: {topo_data['max_height']:.2f}",
+        })
 
-        return jsonify({"annotations": annotations})
+        return jsonify({"annotations": annotations, "measurements": topo_data})
     except Exception as e:
+        logger.error(f"Erreur dans /run_inference : {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
