@@ -8,3 +8,4 @@ torchvision
 Pillow
 opencv-python
 ultralytics
+gunicorn
