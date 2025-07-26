@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: flask-vtk-api
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 5000
