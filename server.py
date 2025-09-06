@@ -24,15 +24,15 @@ logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
 # File d'attente pour limiter les requêtes simultanées
-request_queue = Queue(maxsize=5)
+request_queue = Queue(maxsize=10)
 queue_lock = threading.Lock()
 
 # Charger le modèle MiDaS
 try:
     model_type = "MiDaS_small"
-    midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True)
+    midas = torch.hub.load("intel-isl/MiDaS", model_type, pretrained=True, trust_repo=True)
     midas.eval()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cpu")
     midas.to(device)
     logger.info("Modèle MiDaS chargé avec succès")
 except Exception as e:
@@ -131,6 +131,13 @@ def compute_topography(polydata):
         "avg_slope": float(avg_slope),
     }
 
+def downsample_polydata(polydata, leaf_size=0.01):
+    voxel = vtk.vtkVoxelGrid()
+    voxel.SetInputData(polydata)
+    voxel.SetLeafSize(leaf_size, leaf_size, leaf_size)
+    voxel.Update()
+    return voxel.GetOutput()
+
 @app.route("/upload", methods=["POST"])
 def upload_ply():
     with queue_lock:
@@ -170,23 +177,26 @@ def upload_ply():
         positions = mesh.vertices.astype(np.float32)
         logger.debug(f"Positions extraites : {len(positions)} points")
 
-        if len(positions) > 50000:
-            logger.debug("Décimation du nuage de points")
-            polydata = create_vtk_point_cloud(positions)
-            decimate = vtk.vtkDecimatePro()
-            decimate.SetInputData(polydata)
-            decimate.SetTargetReduction(0.7)
-            decimate.Update()
-            reduced_polydata = decimate.GetOutput()
-            positions = np.array(reduced_polydata.GetPoints().GetData())
-        
-        positions = positions.tolist()
-        
         colors = None
         if hasattr(mesh, "colors") and mesh.colors is not None:
             colors = mesh.colors[:, :3].astype(float) / 255.0
-            colors = colors.tolist()
             logger.debug(f"Couleurs extraites : {len(colors)}")
+
+        polydata = create_vtk_point_cloud(positions, colors)
+
+        if polydata.GetNumberOfPoints() > 50000:
+            logger.debug("Downsampling du nuage de points")
+            polydata = downsample_polydata(polydata)
+
+        positions = np.array(polydata.GetPoints().GetData()).tolist()
+        scalars = polydata.GetPointData().GetScalars()
+        colors = None
+        if scalars:
+            colors_np = np.zeros((scalars.GetNumberOfTuples(), 3), dtype=float)
+            for i in range(scalars.GetNumberOfTuples()):
+                col = scalars.GetTuple3(i)
+                colors_np[i] = [col[0]/255.0, col[1]/255.0, col[2]/255.0]
+            colors = colors_np.tolist()
 
         ply_file, filename = create_ply_file(positions, colors)
         logger.debug("Fichier PLY généré pour /upload")
@@ -236,7 +246,7 @@ def upload_image():
 
         depth = prediction
 
-        results = yolo(image_np, conf=0.5)
+        results = yolo(image_np, conf=0.5, imgsz=320)
         global latest_annotations
         latest_annotations = []
         for result in results:
@@ -260,7 +270,7 @@ def upload_image():
         logger.debug(f"{len(latest_annotations)} anomalies détectées par YOLOv8")
 
         positions = []
-        colors = []
+        colors_list = []
         h, w = depth.shape
         for y in range(0, h, 2):
             for x in range(0, w, 2):
@@ -269,21 +279,105 @@ def upload_image():
                 y_norm = float((y - h / 2) / max(w, h))
                 z_norm = float(z / np.max(depth))
                 positions.append([x_norm, -y_norm, z_norm])
-                colors.append(image_np[y, x] / 255.0)
+                colors_list.append(image_np[y, x] / 255.0)
 
         positions = np.array(positions, dtype=np.float32)
-        if len(positions) > 50000:
-            polydata = create_vtk_point_cloud(positions, colors)
-            decimate = vtk.vtkDecimatePro()
-            decimate.SetInputData(polydata)
-            decimate.SetTargetReduction(0.7)
-            decimate.Update()
-            reduced_polydata = decimate.GetOutput()
-            positions = np.array(reduced_polydata.GetPoints().GetData())
-            colors = colors[:len(positions)] if colors else None
+        colors_list = np.array(colors_list, dtype=float)
+        polydata = create_vtk_point_cloud(positions, colors_list)
+
+        previous_polydata = None
+        if 'previous_positions' in request.form:
+            prev_pos_str = request.form['previous_positions']
+            prev_pos = json.loads(prev_pos_str)
+            prev_positions = np.array(prev_pos, dtype=np.float32)
+            prev_colors = None
+            if 'previous_colors' in request.form:
+                prev_col_str = request.form['previous_colors']
+                prev_col = json.loads(prev_col_str)
+                prev_colors = np.array(prev_col, dtype=float)
+            previous_polydata = create_vtk_point_cloud(prev_positions, prev_colors)
+
+        if previous_polydata:
+            logger.debug("Fusion avec le nuage précédent en cours")
+            icp = vtk.vtkIterativeClosestPointTransform()
+            icp.SetSource(polydata)
+            icp.SetTarget(previous_polydata)
+            icp.GetLandmarkTransform().SetModeToRigidBody()
+            icp.SetMaximumNumberOfIterations(50)
+            icp.SetMaximumNumberOfLandmarks(1000)
+            icp.SetCheckMeanDistance(1)
+            icp.SetMeanDistanceCriterion(0.001)
+            icp.Update()
+
+            transform_filter = vtk.vtkTransformPolyDataFilter()
+            transform_filter.SetInputData(polydata)
+            transform_filter.SetTransform(icp)
+            transform_filter.Update()
+            transformed_polydata = transform_filter.GetOutput()
+
+            # Fusion des points et couleurs
+            merged_points = vtk.vtkPoints()
+            prev_points = previous_polydata.GetPoints()
+            trans_points = transformed_polydata.GetPoints()
+            for i in range(prev_points.GetNumberOfPoints()):
+                merged_points.InsertNextPoint(prev_points.GetPoint(i))
+            for i in range(trans_points.GetNumberOfPoints()):
+                merged_points.InsertNextPoint(trans_points.GetPoint(i))
+
+            merged_colors = None
+            prev_scalars = previous_polydata.GetPointData().GetScalars()
+            trans_scalars = transformed_polydata.GetPointData().GetScalars()
+            if prev_scalars and trans_scalars:
+                merged_colors = vtk.vtkUnsignedCharArray()
+                merged_colors.SetNumberOfComponents(3)
+                merged_colors.SetName("Colors")
+                for i in range(prev_scalars.GetNumberOfTuples()):
+                    col = prev_scalars.GetTuple3(i)
+                    merged_colors.InsertNextTuple3(col[0], col[1], col[2])
+                for i in range(trans_scalars.GetNumberOfTuples()):
+                    col = trans_scalars.GetTuple3(i)
+                    merged_colors.InsertNextTuple3(col[0], col[1], col[2])
+
+            merged_polydata = vtk.vtkPolyData()
+            merged_polydata.SetPoints(merged_points)
+            vertices = vtk.vtkCellArray()
+            for i in range(merged_points.GetNumberOfPoints()):
+                vertex = vtk.vtkVertex()
+                vertex.GetPointIds().SetId(0, i)
+                vertices.InsertNextCell(vertex)
+            merged_polydata.SetVerts(vertices)
+            if merged_colors:
+                merged_polydata.GetPointData().SetScalars(merged_colors)
+
+            if merged_polydata.GetNumberOfPoints() > 50000:
+                logger.debug("Downsampling du nuage fusionné")
+                merged_polydata = downsample_polydata(merged_polydata)
+
+            positions = np.array(merged_polydata.GetPoints().GetData()).tolist()
+            scalars = merged_polydata.GetPointData().GetScalars()
+            colors_list = None
+            if scalars:
+                colors_np = np.zeros((scalars.GetNumberOfTuples(), 3), dtype=float)
+                for i in range(scalars.GetNumberOfTuples()):
+                    col = scalars.GetTuple3(i)
+                    colors_np[i] = [col[0]/255.0, col[1]/255.0, col[2]/255.0]
+                colors_list = colors_np.tolist()
+        else:
+            if len(positions) > 50000:
+                logger.debug("Downsampling du nuage de points")
+                polydata = downsample_polydata(polydata)
+                positions = np.array(polydata.GetPoints().GetData()).tolist()
+                scalars = polydata.GetPointData().GetScalars()
+                if scalars:
+                    colors_np = np.zeros((scalars.GetNumberOfTuples(), 3), dtype=float)
+                    for i in range(scalars.GetNumberOfTuples()):
+                        col = scalars.GetTuple3(i)
+                        colors_np[i] = [col[0]/255.0, col[1]/255.0, col[2]/255.0]
+                    colors_list = colors_np.tolist()
+
         logger.debug(f"Nuage de points créé : {len(positions)} points")
 
-        ply_file, filename = create_ply_file(positions, colors)
+        ply_file, filename = create_ply_file(positions, colors_list)
         logger.debug("Fichier PLY généré")
         request_queue.get_nowait()
         return send_file(

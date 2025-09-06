@@ -1,15 +1,37 @@
-vtk
-trimesh
+# ---------------------------
+# Core Python & utilitaires
+# ---------------------------
 numpy
-flask
-flask-cors
-torch
-torchvision
-Pillow
-opencv-python-headless
-opencv-contrib-python
-ultralytics
-gunicorn
+scipy
 
+# ---------------------------
+# SLAM / Odometry / Vision
+# ---------------------------
 pyslam
 scikit-image
+opencv-python-headless
+opencv-contrib-python
+torch
+torchvision
+timm
+ultralytics
+
+# ---------------------------
+# 3D & Nuages de points
+# ---------------------------
+vtk
+trimesh
+pyntcloud
+pymeshlab
+
+# ---------------------------
+# Serveur / API / Web
+# ---------------------------
+flask
+flask-cors
+gunicorn
+
+# ---------------------------
+# Imagerie / traitement
+# ---------------------------
+Pillow
